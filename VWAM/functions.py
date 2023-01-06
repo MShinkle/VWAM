@@ -1,13 +1,7 @@
-import torchvision
-import torchvision.transforms as transforms
 import torch
-from torch import nn, Tensor
 import numpy as np
 from matplotlib import pyplot as plt
-from tqdm import tqdm
-from IPython import display
 from functools import partial
-import dill as pickle
 from collections import defaultdict
 
 def iterate_through_model(model, mode='children', depth=1):
