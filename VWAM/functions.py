@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from matplotlib import pyplot as plt
 from functools import partial
-from collections import defaultdict
+from collections import OrderedDict
 
 def iterate_through_model(model, mode='children', depth=1):
     """Iterates through model children or modules and yields them.
@@ -51,7 +51,7 @@ def hook_model(model, mode, depth):
     Returns:
         pytorch model: Modified version of model which stores activations in model.activations after forward pass.
     """    
-    model.activations = defaultdict(list)
+    model.activations = OrderedDict()
     for layer_name, child in iterate_through_model(model, mode=mode, depth=depth):
         child.register_forward_hook(partial(store_activations, model.activations, layer_name))
     return model
