@@ -79,7 +79,7 @@ def choose_downsampling(activations, max_fs):
                 if n != int(n):
                     continue
                 else:
-                    pooled = torch.nn.functional.max_pool2D(activations, kernel_size=k, stride=s)
+                    pooled = torch.nn.functional.max_pool2d(activations, kernel_size=k, stride=s)
                     if pooled.shape[-1] > 1 and pooled.numel() <= max_fs:
                         numels[k,s] = pooled.numel()
                     else:
@@ -88,7 +88,7 @@ def choose_downsampling(activations, max_fs):
         if (best_k, best_s) == (0,0):
             return None
         else:
-            return torch.nn.MaxPool2D(kernel_size=(best_k, best_k), stride=best_s)
+            return torch.nn.MaxPool2d(kernel_size=(best_k, best_k), stride=best_s)
     else:
         return None
 
