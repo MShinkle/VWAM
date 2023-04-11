@@ -3,58 +3,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 from functools import partial
 from collections import OrderedDict
-
-def iterate_through_model(model, mode='children', depth=1):
-    """Iterates through model children or modules and yields them.
-    Intended primarily for registering forward hooks.
-
-    Args:
-        model (pytorch model): PyTorch model through which to iterate.
-        mode (str, optional): Whether to iterate through model 'children' or 'modules' . 
-            'modules' will yield all modules throughout the entire model, whereas 'children' will yield all children at a specified 'depth'. Defaults to 'children'.
-        depth (int, optional): Depth at which to return children. 1 will return all model.named_children, 2 will return the children of those children, etc . 
-            If mode=='modules', will be ignored. Defaults to 1.
-
-    Yields:
-        PyTorch module: Depending on kwargs, will yield model modules or children at the specified depth.
-    """    
-    modules = [('filler name', model)]
-    if mode == 'children':
-        for d in range(depth):
-            modules = [named_submodule for name, module in modules for named_submodule in module.named_children()]
-    elif mode == 'modules':
-        modules = model.named_modules()
-    for module in modules:
-        yield module
-
-def store_activations(activations_dict, layer_name, module, input, output):
-    """Stores activations of an individual layer in a dictionary . Intended to be used with forward hooks.
-
-    Args:
-        activations_dict (dict): Dictionary of form {layer name: layer activations}.
-        layer_name (str): Name of layer.
-        module (_type_): Unused, but required input from forward hook
-        input (_type_): Unused, but required input from forward hook
-        output (torch.Tensor): Layer activations, to be saved to activations_dict.
-    """    
-    activations_dict[layer_name] = output
-
-def hook_model(model, mode, depth):
-    """Uses iterate_through_model and forward hooks to modify model to save activations on forward pass.
-    Activations are stored in model.activations.
-
-    Args:
-        model (pytorch model): NN model onto which hooks will be added.
-        mode (str): Whether to iterate through model 'children' or 'modules' . Passed to iterate_through_children.
-        depth (int): Depth at which to return children. Passed to iterate_through_children.
-
-    Returns:
-        pytorch model: Modified version of model which stores activations in model.activations after forward pass.
-    """    
-    model.activations = OrderedDict()
-    for layer_name, child in iterate_through_model(model, mode=mode, depth=depth):
-        child.register_forward_hook(partial(store_activations, model.activations, layer_name))
-    return model
+from torch.utils.data import Dataset
+import glob
+from PIL import Image
 
 def choose_downsampling(activations, max_fs):
     """Selects max pooling downsampling for model layers based on multiple heuristics.
@@ -133,7 +84,7 @@ def get_rf_mask(model, layer_name, indices, input_shape=(1,3,224,224), device='c
     if not isinstance(indices, tuple):
         indices = tuple(indices)
     init_image = torch.zeros(input_shape, dtype=torch.float).to(device).requires_grad_(True)
-    optimizer = torch.optim.Adam([init_image], lr=1e10,)
+    optimizer = torch.optim.SGD([init_image], lr=1e10,)
     optimizer.zero_grad()
     model(init_image);
     loss = torch.moveaxis(torch.moveaxis(model.activations[layer_name], 0, -1)[indices], -1, 0)
