@@ -14,7 +14,7 @@ class SingleImageFolder(Dataset):
         
     def __getitem__(self, index):
         image_path = self.image_paths[index]
-        image = Image.open(image_path)
+        image = Image.open(image_path).convert('RGB')
         if self.transform is not None:
             image = self.transform(image)
         return image
