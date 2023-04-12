@@ -61,8 +61,8 @@ def hook_model(model, layers_dict):
         pytorch model: Modified version of model which stores activations in model.activations after forward pass.
     """    
     model.activations = defaultdict(list)
-    for layer_name, child in layers_dict.items():
-        child.register_forward_hook(partial(store_activations, model.activations, layer_name))
+    for layer_name, layer in layers_dict.items():
+        layer.register_forward_hook(partial(store_activations, model.activations, layer_name))
     return model
 
 def choose_downsampling(activations, max_fs, pooling_type='max'):
@@ -70,16 +70,17 @@ def choose_downsampling(activations, max_fs, pooling_type='max'):
     if activations.ndim == 4:
         max_output_dim = int((max_fs / num_channels)**(1/2))
         if pooling_type == 'max':
-            pooling_object = torch.nn.AdaptiveMaxPool2d(max_output_dim)
+            return torch.nn.AdaptiveMaxPool2d(max_output_dim)
         elif pooling_type == 'avg':
-            pooling_object = torch.nn.AdaptiveAvgPool2d(max_output_dim)
+            return torch.nn.AdaptiveAvgPool2d(max_output_dim)
     elif activations.ndim == 5:
         max_output_dim = int((max_fs / num_channels)**(1/3))
         if pooling_type == 'max':
-            pooling_object = torch.nn.AdaptiveMaxPool3d(max_output_dim)
+            return torch.nn.AdaptiveMaxPool3d(max_output_dim)
         elif pooling_type == 'avg':
-            pooling_object = torch.nn.AdaptiveAvgPool3d(max_output_dim)
-    return pooling_object
+            return torch.nn.AdaptiveAvgPool3d(max_output_dim)
+    else:
+        return None
 
 def show_imgs(imgs, titles=None, show=True, axs=None):
     """Displays pytorch tensors as images.
