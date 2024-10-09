@@ -1,11 +1,14 @@
 import torch
+from torch import nn
 import numpy as np
 import glob
+import warnings
 from PIL import Image
 from functools import partial
-from collections import defaultdict
 from torch.utils.data import Dataset
 from matplotlib import pyplot as plt
+from himalaya.ridge import RidgeCV
+from himalaya.kernel_ridge import KernelRidgeCV
 
 class SingleImageFolder(Dataset):
     def __init__(self, parent_dir, transform=None):
@@ -22,7 +25,7 @@ class SingleImageFolder(Dataset):
     def __len__(self):
         return len(self.image_paths)
 
-def iterate_children(child, parent_name='model', depth=1, keep_dead_ends=True):
+def iterate_children(child, parent_name='model', depth=2, keep_dead_ends=True):
     named_grandchildren = list(child.named_children())
     if len(named_grandchildren) == 0 and keep_dead_ends:
         return {parent_name: child}
@@ -50,7 +53,7 @@ def store_activations(activations_dict, layer_name, module, input, output):
     """   
     activations_dict[layer_name] = output
 
-def hook_model(model, layers_dict):
+def hook_model(model, activations_dict, layers_dict):
     """Uses forward hooks to modify model to save activations on forward pass.
     Activations are stored in model.activations.
 
@@ -60,14 +63,96 @@ def hook_model(model, layers_dict):
     Returns:
         pytorch model: Modified version of model which stores activations in model.activations after forward pass.
     """    
-    model.activations = defaultdict(list)
     for layer_name, layer in layers_dict.items():
-        layer.register_forward_hook(partial(store_activations, model.activations, layer_name))
+        layer.register_forward_hook(partial(store_activations, activations_dict, layer_name))
     return model
 
-def choose_downsampling(activations, max_fs, pooling_type='max'):
+class PCA:
+    def __init__(self, n_components):
+        self.n_components = n_components
+        self.mean = None
+        self.components = None
+
+    def fit(self, X):
+        self.mean = torch.mean(X, dim=0)
+        X_centered = X - self.mean
+        cov_matrix = torch.mm(X_centered.T, X_centered) / (X_centered.size(0) - 1)
+        eigenvalues, eigenvectors = torch.linalg.eig(cov_matrix)
+        eigenvalues = eigenvalues.real
+        eigenvectors = eigenvectors.real
+        sorted_indices = torch.argsort(eigenvalues, descending=True)
+        self.components = eigenvectors[:, sorted_indices][:, :self.n_components]
+
+    def transform(self, X):
+        X_centered = X - self.mean
+        return torch.mm(X_centered, self.components)
+
+    def fit_transform(self, X):
+        self.fit(X)
+        return self.transform(X)
+    
+class TruncatedSVD:
+    def __init__(self, n_components):
+        self.n_components = n_components
+        self.mean = None
+        self.components = None
+
+    def fit(self, X):
+        self.mean = torch.mean(X, dim=0)
+        X_centered = X - self.mean
+        U, S, Vt = torch.linalg.svd(X_centered, full_matrices=False)
+        self.components = Vt[:self.n_components].T
+
+    def transform(self, X):
+        X_centered = X - self.mean
+        return torch.mm(X_centered, self.components)
+
+    def fit_transform(self, X):
+        self.fit(X)
+        return self.transform(X)
+
+def downsample_linear(activations, layer=None, max_fs=1000, pooling_type='conv_max'):
+    num_features = activations.shape[-1]
+    if activations.ndim != 2:
+        raise ValueError(f"Activations must have 2 dimensions, but provided activations have {activations.ndim}.")
+    elif pooling_type == 'weights_pca':
+        pca = PCA(n_components=min(max_fs, num_features))
+        pca.fit(layer.weight.T)
+        return pca.transform
+    elif pooling_type == 'weights_tsvd':
+        tsvd = TruncatedSVD(n_components=min(max_fs, num_features))
+        tsvd.fit(layer.weight.T)
+        return tsvd.transform
+    elif pooling_type == 'activations_pca':
+        pca = PCA(n_components=min(max_fs, num_features))
+        pca.fit(activations.T)
+        pca.components = pca.components.T
+        return pca.transform
+    elif pooling_type == 'activations_tsvd':
+        tsvd = TruncatedSVD(n_components=min(max_fs, num_features))
+        tsvd.fit(activations.T)
+        tsvd.components = tsvd.components.T
+        return tsvd.transform
+    elif pooling_type == 'random_projection':
+        random_vectors = torch.randn(num_features, max_fs, device=activations.device)
+        return lambda x: torch.mm(x, random_vectors)
+    elif pooling_type == 'conv_max':
+        return torch.nn.AdaptiveMaxPool1d(int(max_fs))
+    elif pooling_type == 'conv_avg':
+        return torch.nn.AdaptiveAvgPool1d(int(max_fs))
+    else:
+        raise ValueError(f"Unknown pooling type: {pooling_type}")
+
+
+def downsample_conv(activations, max_fs=1000, pooling_type='max'):
     num_channels = activations.shape[1]
-    if activations.ndim == 4:
+    if activations.ndim == 3:
+        max_output_dim = int((max_fs / num_channels)**(1/1))
+        if pooling_type == 'max':
+            return torch.nn.AdaptiveMaxPool1d(max_output_dim)
+        elif pooling_type == 'avg':
+            return torch.nn.AdaptiveAvgPool1d(max_output_dim)
+    elif activations.ndim == 4:
         max_output_dim = int((max_fs / num_channels)**(1/2))
         if pooling_type == 'max':
             return torch.nn.AdaptiveMaxPool2d(max_output_dim)
@@ -80,7 +165,24 @@ def choose_downsampling(activations, max_fs, pooling_type='max'):
         elif pooling_type == 'avg':
             return torch.nn.AdaptiveAvgPool3d(max_output_dim)
     else:
-        return None
+        raise ValueError(f"Activations must have 3 <= n <=5 dimensions, whereas provided activations have {activations.ndim}.")
+    
+def choose_downsampling(activations, layer=None, layer_name=None, max_fs=1000, linear_pooling=None, conv_pooling='max'):
+    if activations.ndim <= 1:
+        raise ValueError('Dimensionality of activations must be > 1')
+    elif activations.ndim == 2:
+        if linear_pooling is None:
+            return None
+        elif 'weights' in linear_pooling and not hasattr(layer, 'weight'):
+            print(f"Warning: {layer_name} doesn't have a weight tensor, defaulting to random_projection.")
+            linear_pooling = 'random_projection'
+        return downsample_linear(activations=activations, layer=layer, max_fs=max_fs, pooling_type=linear_pooling)
+    elif activations.ndim < 6:
+        if conv_pooling is None:
+            return None
+        return downsample_conv(activations=activations, max_fs=max_fs, pooling_type=conv_pooling)
+    else:
+        raise ValueError(f"Activations must have 2 <= n <=5 dimensions, whereas provided activations have {activations.ndim}.")
 
 def show_imgs(imgs, titles=None, show=True, axs=None):
     """Displays pytorch tensors as images.
@@ -156,7 +258,7 @@ def pink_noise(shape, power=1, fft=False):
         shape (tuple of ints): Desired shape of output noise tensor.
         power (int, optional): Power of the distance from the center (denominator term).  E.g. 1 will yield approximately
             pink noise, 0 white noise and 2 Brownian noise. Defaults to 1.
-        fft (bool, optional): _description_. Defaults to False.
+        fft (bool, optional): _descriptionmodel.activations_flat[:,-1]_. Defaults to False.
 
     Returns:
         torch.Tensor: tensor of specified shape composed of noise following the specified distribution.
@@ -207,27 +309,18 @@ def spect_dist(image, ideal_spect):
     power_2D /= power_2D.sum(-1).sum(-1).unsqueeze(-1).unsqueeze(-1)
     return torch.linalg.norm((ideal_spect - power_2D).flatten(), ord=2)
 
-def linear_decorrelate_color(image):
-    """Modifies input image based on Cholesky-based color decorrelation used in Olah, et al. (2017).
-
-    Args:
-        image (torch.tensor): Image(s) on which to perform decorrelation.  Should be of shape (# images, 3, height, width)
-
-    Returns:
-        torch.Tensor: Decorrelated version of input image.
-    """
-    # Values acquired from lucent/lucid, originally computed from ImageNet
-    color_correlation_svd_sqrt = np.asarray([[0.26, 0.09, 0.02],
-                                            [0.27, 0.00, -0.05],
-                                            [0.27, -0.09, 0.03]]).astype("float32")
-    max_norm_svd_sqrt = np.max(np.linalg.norm(color_correlation_svd_sqrt, axis=0))
+def linear_decorrelate_color(t):
+    color_correlation_svd_sqrt = torch.tensor([
+        [0.26, 0.09, 0.02],
+        [0.27, 0.00, -0.05],
+        [0.27, -0.09, 0.03],
+        ]).to(t.device, t.dtype)
+    max_norm_svd_sqrt = torch.max(torch.linalg.norm(color_correlation_svd_sqrt, axis=0))
+    t_flat = t.reshape(-1, 3)
     color_correlation_normalized = color_correlation_svd_sqrt / max_norm_svd_sqrt
-    color_mean = [0.48, 0.46, 0.41]
-    t_permute = image.permute(0, 2, 3, 1)
-    t_permute = torch.matmul(t_permute, torch.tensor(color_correlation_normalized.T, dtype=t_permute.dtype).to(t_permute.device))
-    t_permute += torch.tensor(color_mean, dtype=t_permute.dtype).to(t_permute.device)
-    image = t_permute.permute(0, 3, 1, 2)
-    return image
+    t_flat = torch.matmul(t_flat, color_correlation_normalized.T)
+    t = t_flat.reshape(t.shape)
+    return t
 
 def compute_argmax_layer(weights, trn_means):
     """Determine which layer is assigned highest summed regression weights.
@@ -249,3 +342,128 @@ def compute_argmax_layer(weights, trn_means):
         i += layer_size
     argmax_layer = np.nanargmax(layer_weights_list, 0)
     return argmax_layer
+
+def fit_himalaya(X, y, alphas=np.logspace(0,15,16)):
+    if X.shape[0] > X.shape[1]:
+        ridge = RidgeCV(alphas=alphas)
+        ridge.fit(X, y)
+    else:
+        ridge = KernelRidgeCV(alphas=alphas)
+        ridge.fit(X, y)
+        ridge.coef = ridge.get_primal_coef(X)
+    return ridge
+
+class VWAMModel(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self._layers = None
+        self._downsamplers = None
+        self._activations = dict()
+        self._activations_downsampled = None
+        self._activations_flat = None
+        self._coef = None
+
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
+    @property
+    def layers(self):
+        if self._layers is None:
+            warnings.warn("Layers have not been chosen yet. Automatically choosing layers with default parameters.")
+            self.choose_layers()  # Automatically choose layers if not already done
+        return self._layers
+
+    @property
+    def downsamplers(self):
+        if self._downsamplers is None:
+            warnings.warn("Downsamplers have not been chosen yet. Automatically choosing downsamplers with default parameters.")
+            self.choose_downsamplers()  # Automatically choose downsamplers if not already done
+        return self._downsamplers
+
+    @property
+    def activations(self):
+        return self._activations
+
+    @property
+    def activations_downsampled(self):
+        self.downsample_activations()  # Automatically downsample activations if not already done
+        return self._activations_downsampled
+
+    @property
+    def activations_flat(self):
+        self._activations_flat = torch.cat([a.flatten(1) for a in self.activations_downsampled.values()], dim=-1)
+        return self._activations_flat
+
+    @property
+    def coef(self):
+        if self._coef is None:
+            raise ValueError("Attribute .coef is not set. This should be a set of regression weights of shape activations X targets, relating downsampled, flattened, and concatenated features to multiple inputs to one or more targets (e.g. voxels). We recommend using https://github.com/gallantlab/himalaya for this purpose, but multiple external packages can be used.")
+        return self._coef
+    
+    @coef.setter
+    def coef(self, value):
+        self._coef = torch.tensor(value, device=self.device)
+
+    def choose_layers(self, depth=2, keep_dead_ends=True, filter_strings=None, filter_weightless=False):
+        self._layers = iterate_children(self.model, depth=depth, keep_dead_ends=keep_dead_ends)
+        if filter_weightless:
+            self._layers = {name: layer for name, layer in self._layers.items() if hasattr(layer, 'weight')}
+        if filter_strings is not None:
+            self._layers = {
+                name: layer for name, layer in self._layers.items()
+                if not any(filter_str in name for filter_str in filter_strings)
+            }
+        self.model = hook_model(self.model, self._activations, self._layers)
+        self.model = hook_model(self.model, self._activations, self._layers)
+
+    def choose_downsamplers(self, activations=None, max_fs=2500, linear_pooling=None, conv_pooling='max'):
+        self._downsamplers = {}
+        if activations is None:
+            activations = self._activations
+        for layer_name, layer_activations in activations.items():
+            self._downsamplers[layer_name] = choose_downsampling(
+                activations=layer_activations, 
+                layer=self._layers[layer_name],
+                layer_name=layer_name,
+                max_fs=max_fs, 
+                linear_pooling=linear_pooling, 
+                conv_pooling=conv_pooling)
+
+    def downsample_activations(self):
+        if self._downsamplers is None:
+            warnings.warn('downsample_activations has been called, but self._downsamplers has not been defined. Running choose_downsamplers with default values.')
+            self.choose_downsamplers()
+        self._activations_downsampled = {}
+        for layer_name, layer_activations in self._activations.items():
+            if layer_name in self._downsamplers.keys():
+                layer_downsampler_fn = self._downsamplers[layer_name]
+                if callable(layer_downsampler_fn):
+                    layer_activations = layer_downsampler_fn(layer_activations)
+            self._activations_downsampled[layer_name] = layer_activations
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.layers is None:
+            warnings.warn('Forward method has been called, but self._layers has not been defined. Running choose_layers with default values.')
+            self.choose_layers()
+        return self.model.forward(x)
+
+    def predict(self, activations=None):
+        if activations is None:
+            activations = self.activations_flat
+        return torch.mm(activations, self.coef)
+    
+def column_corr(A, B, dof=0):
+    """Efficiently compute correlations between columns of two matrices
+    
+    Does NOT compute full correlation matrix btw `A` and `B`; returns a 
+    vector of correlation coefficients. """
+    zs = lambda x: (x-np.nanmean(x, axis=0))/np.nanstd(x, axis=0, ddof=dof)
+    rTmp = np.nansum(zs(A)*zs(B), axis=0)
+    n = A.shape[0]
+    # make sure not to count nans
+    nNaN = np.sum(np.logical_or(np.isnan(zs(A)), np.isnan(zs(B))), 0)
+    n = n - nNaN
+    r = rTmp/n
+    return r
