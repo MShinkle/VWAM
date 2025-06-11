@@ -197,7 +197,7 @@ def show_imgs(imgs, titles=None, show=True, axs=None):
         fig, axs = plt.subplots(nrows=1, ncols=len(imgs), figsize=(5*len(imgs), 5))
     if not isinstance(axs, np.ndarray):
         axs = np.array(axs, dtype='object')
-    imgs = np.clip(imgs.detach().cpu().numpy().astype(np.float),0,1)
+    imgs = np.clip(imgs.detach().cpu().numpy().astype(np.float32),0,1)
     for i, ax in zip(range(len(imgs)), axs.flatten()):
         ax.imshow(np.moveaxis(imgs[i], 0, 2), vmin=0, vmax=1)
         ax.set_xticks([])
