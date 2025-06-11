@@ -18,4 +18,4 @@ See our [demo walkthrough](demo/full_walkthrough.ipynb) for an example of how to
 
 ## News
 
-This work has been accepted as a paper to the [CVPR 2025 MIV workshop](https://sites.google.com/view/miv-cvpr2025/)! See our [arXiv paper](https://arxiv.org/abs/2403.19631) for more details of the technique, as well as results from presenting these feature visualization images to fMRI participants!
+This work has been accepted as a paper to the [CVPR 2025 MIV workshop](https://sites.google.com/view/miv-cvpr2025/)! See our [arXiv paper](https://arxiv.org/abs/2506.04379) for more details of the technique, as well as results from presenting these feature visualization images to fMRI participants!
